@@ -71,8 +71,8 @@ contract Owned {
         transferCount = 0;
     }
 
-    modifier onlyOwner {
-        require(msg.sender == owner);
+    modifier onlyOwner() {
+        require(msg.sender == owner, "TopsBridge: Not Owner");
         _;
     }
 
@@ -333,43 +333,158 @@ contract ERC1132 {
 }
 
 
-contract Token is ERC20Interface, Owned, Pausable, ERC1132 {
+contract TOPSBridge is ERC20Interface, Owned, Pausable, ERC1132 {
     using SafeMath for uint256;
 
     string public symbol;
     string public name;
     uint8 public decimals;
     uint256 private _totalSupply;
+
+    struct UserInfo {
+        uint256 last_deposit_time;
+        uint256 last_withdraw_time;
+        uint256 deposit_amount;
+        uint256 withdraw_amount;
+    }
     
     string internal constant ALREADY_LOCKED = 'Tokens already locked';
     string internal constant NOT_LOCKED = 'No tokens locked';
     string internal constant AMOUNT_ZERO = 'Amount can not be 0';
 
-    /* always capped by 10B tokens */
-    uint256 internal constant MAX_TOTAL_SUPPLY = 10000000000;
+    /* always capped by 1B tokens */
+    uint256 internal constant MAX_TOTAL_SUPPLY = 1000000000;
 
     mapping(address => uint256) balances;
     mapping(address => mapping(address => uint256)) allowed;
     mapping(address => uint256) incomes;
     mapping(address => uint256) expenses;
     mapping(address => bool) frozenAccount;
+    mapping(address => UserInfo) user_info;
+
+    address public submiter;
+    address public owner;
+    uint256 private user_daily_max_deposit_and_withdraw_amount = 20000 * 10 ** 18; //init value
+    uint256 private daily_max_deposit_and_withdraw_amount = 500000 * 10 ** 18; //init value
+    uint256 private user_min_deposit_and_withdraw_amount = 1 * 10 ** 18; //init value
+    uint256 private user_max_deposit_and_withdraw_amount = 20000 * 10 ** 18; //init value
 
     event FreezeAccount(address _address, bool frozen);
+    event tops_to_bsc(bytes32 tops_address, address _address, uint256 amount);
+    event bsc_to_tops(address _address, bytes32 tops_address, uint256 amount);
 
     constructor(
-        uint256 _totalSupply_,
         string _name,
         string _symbol,
-        uint8 _decimals)
+        uint8 _decimals,
+        address _submiter)
         public
     {
-        symbol = _symbol;
+        owner = msg.sender;
         name = _name;
+        symbol = _symbol;
         decimals = _decimals;
-        _totalSupply = _totalSupply_ * 10**uint256(_decimals);
+        submiter = _submiter;
+        _totalSupply = 0;
         balances[owner] = _totalSupply;
 
         emit Transfer(address(0), owner, _totalSupply);
+    }
+
+    modifier onlySubmiter() {
+        require(msg.sender == submiter, "TopsBridge:Not Submiter");
+        _;
+    }
+
+    modifier crossChainVerification(address user, uint256 amount, bool deposit_or_withdraw) {
+        require(amount >= user_min_deposit_and_withdraw_amount && amount <= user_max_deposit_and_withdraw_amount, "TopsBridge: Exceeding range limits");
+        UserInfo storage di = user_info[user];
+        if(deposit_or_withdraw) {
+            uint256 last_deposit_time = di.last_deposit_time;
+            if(last_deposit_time == 0) {
+                require(amount <= user_daily_max_deposit_and_withdraw_amount,"TopsBridge: Execeed the daily limit");
+                di.last_deposit_time = block.timestamp;
+                di.deposit_amount = amount;
+            }else {
+                uint256 pass_deposit_time = block.timestamp.sub(last_deposit_time);
+                if(pass_deposit_time <= 1 days){
+                    uint256 total_deposit_amount = di.deposit_amount.add(amount);
+                    require(total_deposit_amount <= user_daily_max_deposit_and_withdraw_amount, "TopsBridge: Execeed the daily limit");
+                    di.deposit_amount = total_deposit_amount;
+                }else{
+                    require(amount <= user_daily_max_deposit_and_withdraw_amount, "TopsBridge: Execeed the daily limit");
+                    di.last_deposit_time = block.timestamp;
+                    di.deposit_amount = amount;
+
+                }
+            }
+        }else {
+            uint256 last_withdraw_time = di.last_withdraw_time;
+            if(last_withdraw_time == 0){
+                di.last_withdraw_time = block.timestamp;
+                di.withdraw_amount += amount;
+            }else{
+                uint256 pass_withdraw_time = block.timestamp.sub(last_withdraw_time);
+                if(pass_withdraw_time <= 1 days){
+                    uint256 total_withdraw_amount = di.withdraw_amount.add(amount);
+                    require(total_withdraw_amount <= daily_max_deposit_and_withdraw_amount, "TopsBridge: Execeed contract deposit limit");
+                    di.withdraw_amount = total_withdraw_amount;
+                }else{
+                    di.withdraw_amount = amount;
+                    di.last_withdraw_time = block.timestamp;
+                }
+                
+            }
+        }
+        _;
+    }
+
+    function changeSubmiter(address _newSubmiter) external onlyOwner{
+        submiter = _newSubmiter;
+    }
+
+    function setUserDailyMax(uint256 max_amount) external onlyOwner returns(bool){
+        user_daily_max_deposit_and_withdraw_amount = max_amount;
+        return true;
+    }
+
+    function setDailyMax(uint256 max_amount) external onlyOwner returns(bool){
+        daily_max_deposit_and_withdraw_amount = max_amount;
+        return true;
+    }
+
+    function setUserMin(uint256 min_amount) external onlyOwner returns(bool){
+        user_min_deposit_and_withdraw_amount = min_amount;
+        return true;
+    }
+
+    function setUserMax(uint256 max_amount) external onlyOwner returns(bool){
+        user_max_deposit_and_withdraw_amount = max_amount;
+        return true;
+    }
+
+    function transferOwnerShip(address _newOwner) onlyOwner external{
+        owner = _newOwner;
+    }
+
+    function bridge_tops_to_bsc(bytes32 tops_address, address sender_address, uint256 amount) external onlySubmiter crossChainVerification(sender_address, amount, true) returns(bool) {
+        if(_mint(sender_address, amount)) {
+            emit tops_to_bsc(tops_address, sender_address, amount);
+            return true;
+        }
+        else {
+            return false;
+        }
+    }
+
+    function bridge_bsc_to_tops(bytes32 tops_address, uint256 amount) external crossChainVerification(msg.sender, amount, false) returns(bool) {
+        if(_burn(msg.sender, amount)) {
+            emit bsc_to_tops(msg.sender, tops_address, amount);
+            return true;
+        }
+        else {
+            return false;
+        }
     }
 
     function totalSupply()
@@ -532,12 +647,16 @@ contract Token is ERC20Interface, Owned, Pausable, ERC1132 {
         onlyOwner 
         returns (bool success)
     {
+        return _mint(owner, amount);
+    }
+
+    function _mint(address target_address, uint256 amount) private returns (bool success) {
         uint256 newSupply = _totalSupply + amount;
         require(newSupply <= MAX_TOTAL_SUPPLY * 10 **uint256(decimals), "ERC20: exceed maximum total supply");
 
         _totalSupply = newSupply;
-        balances[owner] += amount;
-        emit Transfer(address(0), owner, amount);
+        balances[target_address] += amount;
+        emit Transfer(address(0), target_address, amount);
         return true;
     }
 
@@ -547,12 +666,16 @@ contract Token is ERC20Interface, Owned, Pausable, ERC1132 {
         whenNotPaused
         returns (bool success)
     {
-        require (balances[msg.sender] >= amount);
-        require(!frozenAccount[msg.sender]);
-        balances[msg.sender] = balances[msg.sender].sub(amount);
+        return _burn(msg.sender, amount);
+    }
+
+    function _burn(address target_address, uint256 amount) private returns (bool success) {
+        require (balances[target_address] >= amount);
+        require(!frozenAccount[target_address]);
+        balances[target_address] = balances[target_address].sub(amount);
         _totalSupply -= amount;
 
-        emit Transfer(msg.sender, address(0), amount);
+        emit Transfer(target_address, address(0), amount);
         return true;
     }
 
